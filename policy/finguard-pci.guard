@@ -1,0 +1,71 @@
+#
+# FinGuard policy-as-code: PCI DSS v4.0.1 guardrails evaluated on every pull request
+# before a template may reach the account (shift-left compliance).
+#
+
+let tables       = Resources.*[ Type == 'AWS::DynamoDB::Table' ]
+let buckets      = Resources.*[ Type == 'AWS::S3::Bucket' ]
+let log_groups   = Resources.*[ Type == 'AWS::Logs::LogGroup' ]
+let functions    = Resources.*[ Type == 'AWS::Lambda::Function'
+                                some Properties.Tags[*] { Key == 'pci-scope' Value == 'cde' } ]
+let keys         = Resources.*[ Type == 'AWS::KMS::Key' Properties.KeySpec !exists ]
+let stages       = Resources.*[ Type == 'AWS::ApiGateway::Stage' ]
+let trails       = Resources.*[ Type == 'AWS::CloudTrail::Trail' ]
+
+# Req. 3.5 - stored account data encrypted with a customer managed key
+rule PCI_3_5_TABLE_CMK when %tables !empty {
+    %tables.Properties.SSESpecification.SSEEnabled == true
+    %tables.Properties.SSESpecification.SSEType == 'KMS'
+    %tables.Properties.SSESpecification.KMSMasterKeyId exists
+        <<Cardholder tables must use SSE-KMS with a customer managed key>>
+}
+
+# Req. 12.10 / DORA Art. 12 - recoverability of critical data
+rule PCI_12_10_TABLE_PITR when %tables !empty {
+    %tables.Properties.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled == true
+        <<Point-in-time recovery must be enabled on every table>>
+}
+
+# Req. 3.5 / 4.2 - buckets encrypted with KMS and never public
+rule PCI_3_5_BUCKET_KMS when %buckets !empty {
+    %buckets.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'aws:kms'
+    %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+    %buckets.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+    %buckets.Properties.VersioningConfiguration.Status == 'Enabled'
+        <<Buckets must be KMS-encrypted, versioned and fully blocked from public access>>
+}
+
+# Req. 10.5.1 - audit logs retained for at least 12 months and encrypted
+rule PCI_10_5_LOG_RETENTION when %log_groups !empty {
+    %log_groups.Properties.RetentionInDays >= 365
+    %log_groups.Properties.KmsKeyId exists
+        <<Log groups must keep 365+ days and be encrypted with KMS>>
+}
+
+# Req. 1.3 / 1.4 - CDE compute has no direct internet path
+rule PCI_1_3_LAMBDA_IN_VPC when %functions !empty {
+    %functions.Properties.VpcConfig.SubnetIds exists
+    %functions.Properties.TracingConfig.Mode == 'Active'
+        <<CDE functions must run in private subnets with tracing enabled>>
+}
+
+# Req. 3.6 / 3.7 - symmetric keys rotate automatically
+rule PCI_3_6_KEY_ROTATION when %keys !empty {
+    %keys.Properties.EnableKeyRotation == true
+        <<Symmetric customer managed keys must have rotation enabled>>
+}
+
+# Req. 3.3 - never write request bodies (PAN) to execution logs
+rule PCI_3_3_NO_DATA_TRACE when %stages !empty {
+    %stages.Properties.MethodSettings[*].DataTraceEnabled == false
+    %stages.Properties.TracingEnabled == true
+        <<API stages must disable data tracing and enable X-Ray>>
+}
+
+# Req. 10.3.4 - integrity of audit logs
+rule PCI_10_3_TRAIL_INTEGRITY when %trails !empty {
+    %trails.Properties.EnableLogFileValidation == true
+    %trails.Properties.IsMultiRegionTrail == true
+    %trails.Properties.KMSKeyId exists
+        <<CloudTrail must be multi-region, KMS-encrypted and validated>>
+}

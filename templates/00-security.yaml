@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  FinGuard PCI PoC - Layer 0 security & audit baseline. Customer managed KMS keys
+  (data, HMAC tokenisation, logs), immutable CloudTrail with log-file validation,
+  CIS/PCI alarm set, GuardDuty, AWS Config conformance rules, MFA-gated human
+  roles with separation of duties, a workload permission boundary and the $1 budget.
+
+Parameters:
+  Project:
+    Type: String
+    Default: finguard
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail for security and budget alerts (must be confirmed)
+  EnableGuardDuty:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  EnableConfig:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Create the PCI Config rules (needs a running recorder - see deploy.sh)
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  CreateGuardDuty: !Equals [!Ref EnableGuardDuty, "true"]
+  CreateConfig: !Equals [!Ref EnableConfig, "true"]
+
+Resources:
+  # =====================================================================
+  # 1. Key management (PCI DSS Req. 3.6 / 3.7)
+  # =====================================================================
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: FinGuard CDE data key - DynamoDB, S3 settlement files, Lambda env
+      EnableKeyRotation: true
+      RotationPeriodInDays: 90
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: DenyDecryptOutsideCdeServices
+            Effect: Deny
+            Principal: "*"
+            Action: ["kms:Decrypt", "kms:ReEncrypt*"]
+            Resource: "*"
+            Condition:
+              StringNotLike:
+                "kms:ViaService": ["dynamodb.*.amazonaws.com", "s3.*.amazonaws.com", "lambda.*.amazonaws.com", "backup.*.amazonaws.com"]
+              Bool:
+                "aws:PrincipalIsAWSService": "false"   # humans and roles only; service principals validate the key
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties: { AliasName: !Sub "alias/${Project}-cde-data", TargetKeyId: !Ref DataKey }
+
+  # HMAC key: PAN tokenisation happens INSIDE KMS. Only GenerateMac/VerifyMac allowed.
+  TokenKey:
+    Type: AWS::KMS::Key
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_7
+            comment: "HMAC_256 keys do not support automatic rotation in KMS; rotated manually with alias swap"
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: FinGuard PAN tokenisation key (HMAC_256)
+      KeySpec: HMAC_256
+      KeyUsage: GENERATE_VERIFY_MAC
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+  TokenKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties: { AliasName: !Sub "alias/${Project}-pan-token", TargetKeyId: !Ref TokenKey }
+
+  LogKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: FinGuard audit/log key - CloudTrail, CloudWatch Logs, SNS
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: CloudTrailEncrypt
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: ["kms:GenerateDataKey*", "kms:DescribeKey"]
+            Resource: "*"
+            Condition:
+              StringEquals: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${Project}-audit-trail" }
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: ["kms:Encrypt*", "kms:Decrypt*", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:Describe*"]
+            Resource: "*"
+            Condition:
+              ArnLike: { "kms:EncryptionContext:aws:logs:arn": !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*" }
+          - Sid: AwsConfigDelivery
+            Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: ["kms:Decrypt", "kms:GenerateDataKey"]
+            Resource: "*"
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
+          - Sid: AlarmsAndEventsToEncryptedSns
+            Effect: Allow
+            Principal: { Service: [cloudwatch.amazonaws.com, events.amazonaws.com, budgets.amazonaws.com] }
+            Action: ["kms:Decrypt", "kms:GenerateDataKey*"]
+            Resource: "*"
+  LogKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties: { AliasName: !Sub "alias/${Project}-audit-logs", TargetKeyId: !Ref LogKey }
+
+  # =====================================================================
+  # 2. Alerting channel
+  # =====================================================================
+  SecurityTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Project}-security-alerts"
+      KmsMasterKeyId: !Ref LogKey
+  SecurityTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SecurityTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAwsServicesToPublish
+            Effect: Allow
+            Principal: { Service: [cloudwatch.amazonaws.com, events.amazonaws.com, budgets.amazonaws.com] }
+            Action: sns:Publish
+            Resource: !Ref SecurityTopic
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref SecurityTopic
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+  SecurityTopicEmail:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties: { TopicArn: !Ref SecurityTopic, Protocol: email, Endpoint: !Ref AlertEmail }
+
+  # =====================================================================
+  # 3. Immutable audit trail (PCI DSS Req. 10.2 / 10.3 / 10.5)
+  # =====================================================================
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Object Lock audit bucket is the terminal log store; access is recorded by CloudTrail data events"
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${Project}-audit-${AWS::AccountId}-${AWS::Region}"
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule: { DefaultRetention: { Mode: GOVERNANCE, Days: 1 } }   # PoC; production: COMPLIANCE, 365 days
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms, KMSMasterKeyID: !GetAtt LogKey.Arn }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-after-90-days
+            Status: Enabled
+            Transitions: [{ StorageClass: GLACIER_IR, TransitionInDays: 90 }]
+            ExpirationInDays: 400
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+  AuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuditBucket.Arn
+            Condition: { StringEquals: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${Project}-audit-trail" } }
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${AuditBucket.Arn}/cloudtrail/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${Project}-audit-trail"
+          - Sid: DenyNonTls
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt AuditBucket.Arn, !Sub "${AuditBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # Configuration history goes to its own bucket: AWS Config's delivery check could not
+  # write into the Object Lock audit bucket during the first deployment.
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Configuration snapshots only; reads are recorded by CloudTrail"
+    Properties:
+      BucketName: !Sub "${Project}-config-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms, KMSMasterKeyID: !GetAtt LogKey.Arn }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerPreferred }] }
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ConfigAclCheck
+            Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: [s3:GetBucketAcl, s3:ListBucket]
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition: { StringEquals: { "AWS:SourceAccount": !Ref "AWS::AccountId" } }
+          - Sid: ConfigWrite
+            Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${ConfigBucket.Arn}/config/AWSLogs/${AWS::AccountId}/Config/*"
+            Condition: { StringEquals: { "s3:x-amz-acl": bucket-owner-full-control, "AWS:SourceAccount": !Ref "AWS::AccountId" } }
+          - Sid: DenyNonTls
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ConfigBucket.Arn, !Sub "${ConfigBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  TrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/${Project}/cloudtrail"
+      RetentionInDays: 365
+      KmsKeyId: !GetAtt LogKey.Arn
+  TrailToLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: cloudtrail.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: trail-to-cloudwatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${TrailLogGroup.Arn}"
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: AuditBucketPolicy
+    Properties:
+      TrailName: !Sub "${Project}-audit-trail"
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      S3BucketName: !Ref AuditBucket
+      S3KeyPrefix: cloudtrail
+      KMSKeyId: !GetAtt LogKey.Arn
+      CloudWatchLogsLogGroupArn: !GetAtt TrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt TrailToLogsRole.Arn
+      AdvancedEventSelectors:
+        - Name: All management events
+          FieldSelectors:
+            - { Field: eventCategory, Equals: [Management] }
+        - Name: Data events on the cardholder-data table (who touched CHD)
+          FieldSelectors:
+            - { Field: eventCategory, Equals: [Data] }
+            - { Field: resources.type, Equals: ["AWS::DynamoDB::Table"] }
+            - { Field: resources.ARN, StartsWith: [!Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Project}-"] }
+        - Name: Data events on the settlement-file bucket
+          FieldSelectors:
+            - { Field: eventCategory, Equals: [Data] }
+            - { Field: resources.type, Equals: ["AWS::S3::Object"] }
+            - { Field: resources.ARN, StartsWith: [!Sub "arn:${AWS::Partition}:s3:::${Project}-settlement-${AWS::AccountId}-${AWS::Region}/"] }
+
+  # CIS AWS Foundations / PCI DSS 10.4 alarm set on the trail log group
+  # Each entry: metric filter -> alarm -> encrypted SNS topic
+  RootUsageFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != "AwsServiceEvent" }'
+      MetricTransformations: [{ MetricNamespace: !Sub "${Project}/Security", MetricName: RootAccountUsage, MetricValue: "1" }]
+  RootUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-root-account-usage"
+      Namespace: !Sub "${Project}/Security"
+      MetricName: RootAccountUsage
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref SecurityTopic]
+  UnauthorizedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+      MetricTransformations: [{ MetricNamespace: !Sub "${Project}/Security", MetricName: UnauthorizedApiCalls, MetricValue: "1" }]
+  UnauthorizedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-unauthorized-api-calls"
+      Namespace: !Sub "${Project}/Security"
+      MetricName: UnauthorizedApiCalls
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref SecurityTopic]
+  IamChangeFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ ($.eventSource = iam.amazonaws.com) && (($.eventName = Put*Policy) || ($.eventName = Attach*Policy) || ($.eventName = Detach*Policy) || ($.eventName = Delete*Policy) || ($.eventName = CreatePolicyVersion)) }'
+      MetricTransformations: [{ MetricNamespace: !Sub "${Project}/Security", MetricName: IamPolicyChanges, MetricValue: "1" }]
+  IamChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-iam-policy-changes"
+      Namespace: !Sub "${Project}/Security"
+      MetricName: IamPolicyChanges
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref SecurityTopic]
+  KeyTamperFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ ($.eventSource = kms.amazonaws.com) && (($.eventName = DisableKey) || ($.eventName = ScheduleKeyDeletion)) }'
+      MetricTransformations: [{ MetricNamespace: !Sub "${Project}/Security", MetricName: KmsKeyTampering, MetricValue: "1" }]
+  KeyTamperAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-kms-key-disable-or-delete"
+      Namespace: !Sub "${Project}/Security"
+      MetricName: KmsKeyTampering
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref SecurityTopic]
+  NetworkChangeFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ ($.eventName = AuthorizeSecurityGroupIngress) || ($.eventName = AuthorizeSecurityGroupEgress) || ($.eventName = CreateNetworkAclEntry) || ($.eventName = ReplaceRoute) || ($.eventName = CreateRoute) || ($.eventName = AttachInternetGateway) }'
+      MetricTransformations: [{ MetricNamespace: !Sub "${Project}/Security", MetricName: NetworkChanges, MetricValue: "1" }]
+  NetworkChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-network-config-changes"
+      Namespace: !Sub "${Project}/Security"
+      MetricName: NetworkChanges
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref SecurityTopic]
+  TrailTamperFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ ($.eventName = StopLogging) || ($.eventName = DeleteTrail) || ($.eventName = UpdateTrail) }'
+      MetricTransformations: [{ MetricNamespace: !Sub "${Project}/Security", MetricName: TrailTampering, MetricValue: "1" }]
+  TrailTamperAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-cloudtrail-tampering"
+      Namespace: !Sub "${Project}/Security"
+      MetricName: TrailTampering
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref SecurityTopic]
+
+  # =====================================================================
+  # 4. Threat detection and configuration compliance
+  # =====================================================================
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Condition: CreateGuardDuty
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+  GuardDutyFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Project}-guardduty-high-findings"
+      EventPattern:
+        source: [aws.guardduty]
+        detail-type: [GuardDuty Finding]
+        detail: { severity: [{ numeric: [">=", 7] }] }
+      Targets: [{ Arn: !Ref SecurityTopic, Id: sns }]
+
+  # The recorder and delivery channel are created by scripts/deploy.sh in strict order
+  # (recorder -> channel -> start): created in parallel by CloudFormation they
+  # deadlock and the stack times out (observed during the first deployment).
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: config.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWS_ConfigRole"]
+      Policies:
+        - PolicyName: deliver-to-audit-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: s3:PutObject, Resource: !Sub "${ConfigBucket.Arn}/config/*" }
+              - { Effect: Allow, Action: s3:GetBucketAcl, Resource: !GetAtt ConfigBucket.Arn }
+              - { Effect: Allow, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: !GetAtt LogKey.Arn }
+
+  RuleDynamoPitr:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-dynamodb-pitr", Source: { Owner: AWS, SourceIdentifier: DYNAMODB_PITR_ENABLED }, Scope: { ComplianceResourceTypes: ["AWS::DynamoDB::Table"] } }
+  RuleDynamoKms:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-dynamodb-cmk", Source: { Owner: AWS, SourceIdentifier: DYNAMODB_TABLE_ENCRYPTED_KMS }, Scope: { ComplianceResourceTypes: ["AWS::DynamoDB::Table"] } }
+  RuleS3Tls:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-s3-tls-only", Source: { Owner: AWS, SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY }, Scope: { ComplianceResourceTypes: ["AWS::S3::Bucket"] } }
+  RuleS3Public:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-s3-no-public-read", Source: { Owner: AWS, SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED }, Scope: { ComplianceResourceTypes: ["AWS::S3::Bucket"] } }
+  RuleTrailValidation:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-trail-log-validation", Source: { Owner: AWS, SourceIdentifier: CLOUD_TRAIL_LOG_FILE_VALIDATION_ENABLED } }
+  RuleKeyRotation:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-kms-rotation", Source: { Owner: AWS, SourceIdentifier: CMK_BACKING_KEY_ROTATION_ENABLED } }
+  RuleFlowLogs:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-vpc-flow-logs", Source: { Owner: AWS, SourceIdentifier: VPC_FLOW_LOGS_ENABLED } }
+  RuleDefaultSg:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-default-sg-closed", Source: { Owner: AWS, SourceIdentifier: VPC_DEFAULT_SECURITY_GROUP_CLOSED }, Scope: { ComplianceResourceTypes: ["AWS::EC2::SecurityGroup"] } }
+  RuleLambdaVpc:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfig
+    Properties: { ConfigRuleName: !Sub "${Project}-pci-lambda-in-vpc", Source: { Owner: AWS, SourceIdentifier: LAMBDA_INSIDE_VPC }, Scope: { ComplianceResourceTypes: ["AWS::Lambda::Function"] } }
+
+  AccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: !Sub "${Project}-external-access"
+      Type: ACCOUNT
+
+  # =====================================================================
+  # 5. Identity: MFA-gated human roles, separation of duties, boundaries
+  # =====================================================================
+  WorkloadBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "Permission boundary is a ceiling, not a grant; resources are scoped in each role policy"
+          - id: CKV_AWS_108
+            comment: "Boundary only; s3:GetObject is constrained by the S3 endpoint policy (s3:ResourceAccount)"
+          - id: CKV_AWS_109
+            comment: "Boundary explicitly denies iam:* and key-policy changes"
+    Properties:
+      ManagedPolicyName: !Sub "${Project}-workload-permission-boundary"
+      Description: Ceiling for every workload role - no IAM, no key or trail tampering, no internet gateways
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowWithinCde
+            Effect: Allow
+            Action: ["dynamodb:*", "kms:GenerateMac", "kms:VerifyMac", "kms:Decrypt", "kms:GenerateDataKey", "logs:*", "xray:*", "s3:GetObject", "s3:PutObject", "ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface", "ec2:AssignPrivateIpAddresses", "ec2:UnassignPrivateIpAddresses"]
+            Resource: "*"
+          - Sid: HardDenies
+            Effect: Deny
+            Action: ["iam:*", "kms:ScheduleKeyDeletion", "kms:DisableKey", "kms:PutKeyPolicy", "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "ec2:CreateInternetGateway", "ec2:AttachInternetGateway", "dynamodb:DeleteTable", "dynamodb:UpdateContinuousBackups"]
+            Resource: "*"
+
+  PlatformAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-platform-admin"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: sts:AssumeRole
+            Condition:
+              Bool: { "aws:MultiFactorAuthPresent": "true" }
+              NumericLessThan: { "aws:MultiFactorAuthAge": "3600" }
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess"]
+      Policies:
+        - PolicyName: no-cardholder-data-reads
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AdminsBuildButDoNotReadChd
+                Effect: Deny
+                Action: ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan", "kms:GenerateMac"]
+                Resource: "*"
+  AuditorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-qsa-auditor"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: sts:AssumeRole
+            Condition:
+              Bool: { "aws:MultiFactorAuthPresent": "true" }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/SecurityAudit"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSCloudTrail_ReadOnlyAccess"
+      Policies:
+        - PolicyName: read-audit-evidence-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: ["s3:GetObject", "s3:ListBucket"], Resource: [!GetAtt AuditBucket.Arn, !Sub "${AuditBucket.Arn}/*"] }
+              - { Effect: Allow, Action: "kms:Decrypt", Resource: !GetAtt LogKey.Arn }
+              - { Effect: Deny, Action: ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "kms:GenerateMac"], Resource: "*" }
+
+  # =====================================================================
+  # 6. Cost guardrail - the $1 ceiling
+  # =====================================================================
+  PocBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${Project}-poc-1usd"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: 1, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: SNS, Address: !Ref SecurityTopic }]
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: SNS, Address: !Ref SecurityTopic }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: SNS, Address: !Ref SecurityTopic }]
+
+Outputs:
+  DataKeyArn: { Value: !GetAtt DataKey.Arn, Export: { Name: !Sub "${Project}-DataKeyArn" } }
+  TokenKeyArn: { Value: !GetAtt TokenKey.Arn, Export: { Name: !Sub "${Project}-TokenKeyArn" } }
+  LogKeyArn: { Value: !GetAtt LogKey.Arn, Export: { Name: !Sub "${Project}-LogKeyArn" } }
+  SecurityTopicArn: { Value: !Ref SecurityTopic, Export: { Name: !Sub "${Project}-SecurityTopicArn" } }
+  WorkloadBoundaryArn: { Value: !Ref WorkloadBoundary, Export: { Name: !Sub "${Project}-WorkloadBoundaryArn" } }
+  AuditBucketName: { Value: !Ref AuditBucket, Export: { Name: !Sub "${Project}-AuditBucket" } }
+  ConfigRoleArn: { Value: !GetAtt ConfigRole.Arn }
+  ConfigBucketName: { Value: !Ref ConfigBucket }

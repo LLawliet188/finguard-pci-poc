@@ -1,0 +1,19 @@
+# Deliberately non-compliant fixture: proves the guard rules actually fail.
+Resources:
+  BadTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+  BadFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: a.b
+      Role: arn:aws:iam::111111111111:role/x
+      Code: { ZipFile: "x" }
+      Tags: [{ Key: pci-scope, Value: cde }]
+  BadLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: { RetentionInDays: 7 }

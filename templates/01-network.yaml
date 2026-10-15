@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  FinGuard PCI PoC - Layer 1 network. Three-tier VPC over two Availability Zones
+  (public / private-app / isolated-data), no internet egress from the cardholder
+  data environment (CDE), gateway + interface endpoints, DNS Firewall allow-list,
+  VPC Flow Logs and an optional site-to-site VPN to the bank partner.
+
+Parameters:
+  Project:
+    Type: String
+    Default: finguard
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  LogKeyArn:
+    Type: String
+    Description: KMS key ARN (from the security stack) used to encrypt log groups
+  EnableVpn:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  PartnerGatewayIp:
+    Type: String
+    Description: Public IP of the partner bank's VPN device (simulated)
+    Default: 198.51.100.24
+  PartnerCidr:
+    Type: String
+    Default: 172.31.200.0/24
+  DynamoPrefixListId:
+    Type: String
+    Description: AWS-managed prefix list for DynamoDB in this Region (resolved by deploy.sh)
+  S3PrefixListId:
+    Type: String
+    Description: AWS-managed prefix list for S3 in this Region (resolved by deploy.sh)
+
+Conditions:
+  CreateVpn: !Equals [!Ref EnableVpn, "true"]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${Project}-vpc" }, { Key: pci-scope, Value: cde }]
+
+  # The default security group is emptied by scripts/deploy.sh after creation:
+  # CloudFormation cannot remove its built-in rules (finding raised by AWS Config).
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${Project}-igw" }]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+
+  # ---------------- Subnets: 3 tiers x 2 AZs ----------------
+  PublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${Project}-public-a" }, { Key: tier, Value: public }]
+  PublicB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${Project}-public-b" }, { Key: tier, Value: public }]
+  AppA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${Project}-app-a" }, { Key: tier, Value: private-app }]
+  AppB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${Project}-app-b" }, { Key: tier, Value: private-app }]
+  DataA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${Project}-data-a" }, { Key: tier, Value: isolated-data }]
+  DataB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${Project}-data-b" }, { Key: tier, Value: isolated-data }]
+
+  # ---------------- Route tables ----------------
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${Project}-rt-public" }]
+  PublicDefault:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: { RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicA, RouteTableId: !Ref PublicRt }
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicB, RouteTableId: !Ref PublicRt }
+
+  # App tier: NO default route to the internet. AWS APIs are reached via endpoints,
+  # the partner bank via the VPN (route propagation below).
+  AppRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${Project}-rt-app" }]
+  AppAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppA, RouteTableId: !Ref AppRt }
+  AppAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppB, RouteTableId: !Ref AppRt }
+
+  DataRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${Project}-rt-data-isolated" }]
+  DataAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataA, RouteTableId: !Ref DataRt }
+  DataAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataB, RouteTableId: !Ref DataRt }
+
+  # ---------------- Network ACLs (stateless second layer) ----------------
+  AppNacl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${Project}-nacl-app" }]
+  AppNaclInVpc:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref AppNacl, RuleNumber: 100, Protocol: 6, RuleAction: allow, CidrBlock: !Ref VpcCidr, PortRange: { From: 443, To: 443 } }
+  AppNaclInEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref AppNacl, RuleNumber: 110, Protocol: 6, RuleAction: allow, CidrBlock: 0.0.0.0/0, PortRange: { From: 1024, To: 65535 } }
+  AppNaclInPartner:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref AppNacl, RuleNumber: 120, Protocol: 6, RuleAction: allow, CidrBlock: !Ref PartnerCidr, PortRange: { From: 443, To: 443 } }
+  AppNaclOutHttps:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref AppNacl, RuleNumber: 100, Egress: true, Protocol: 6, RuleAction: allow, CidrBlock: 0.0.0.0/0, PortRange: { From: 443, To: 443 } }
+  AppNaclOutEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref AppNacl, RuleNumber: 110, Egress: true, Protocol: 6, RuleAction: allow, CidrBlock: !Ref VpcCidr, PortRange: { From: 1024, To: 65535 } }
+  AppNaclOutPartnerEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref AppNacl, RuleNumber: 120, Egress: true, Protocol: 6, RuleAction: allow, CidrBlock: !Ref PartnerCidr, PortRange: { From: 1024, To: 65535 } }
+  AppNaclAssocA:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties: { SubnetId: !Ref AppA, NetworkAclId: !Ref AppNacl }
+  AppNaclAssocB:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties: { SubnetId: !Ref AppB, NetworkAclId: !Ref AppNacl }
+
+  DataNacl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${Project}-nacl-data" }]
+  DataNaclInApp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref DataNacl, RuleNumber: 100, Protocol: 6, RuleAction: allow, CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]], PortRange: { From: 443, To: 5432 } }
+  DataNaclInAppB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref DataNacl, RuleNumber: 110, Protocol: 6, RuleAction: allow, CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]], PortRange: { From: 443, To: 5432 } }
+  DataNaclOutApp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref DataNacl, RuleNumber: 100, Egress: true, Protocol: 6, RuleAction: allow, CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]], PortRange: { From: 1024, To: 65535 } }
+  DataNaclOutAppB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties: { NetworkAclId: !Ref DataNacl, RuleNumber: 110, Egress: true, Protocol: 6, RuleAction: allow, CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]], PortRange: { From: 1024, To: 65535 } }
+  DataNaclAssocA:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties: { SubnetId: !Ref DataA, NetworkAclId: !Ref DataNacl }
+  DataNaclAssocB:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties: { SubnetId: !Ref DataB, NetworkAclId: !Ref DataNacl }
+
+  # ---------------- Security groups (stateful, least privilege) ----------------
+  LambdaSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Transaction Lambda - egress HTTPS to VPC endpoints and partner only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref DynamoPrefixListId, Description: DynamoDB gateway endpoint }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationPrefixListId: !Ref S3PrefixListId, Description: S3 gateway endpoint }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref VpcCidr, Description: Interface endpoints (KMS) }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref PartnerCidr, Description: Partner bank over VPN }
+      Tags: [{ Key: Name, Value: !Sub "${Project}-sg-lambda" }]
+  EndpointSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface endpoints - HTTPS only from the Lambda SG
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref LambdaSg, Description: From transaction Lambda }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 127.0.0.1/32, Description: No egress needed }
+      Tags: [{ Key: Name, Value: !Sub "${Project}-sg-endpoints" }]
+
+  # ---------------- VPC endpoints (private path to AWS APIs) ----------------
+  DynamoEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRt, !Ref DataRt]
+      PolicyDocument:   # data-perimeter: only tables in this account
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "dynamodb:*"
+            Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*"
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRt, !Ref DataRt]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+            Resource: "*"
+            Condition:
+              StringEquals: { "s3:ResourceAccount": !Ref "AWS::AccountId" }
+  KmsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.kms"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppA, !Ref AppB]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: ["kms:GenerateMac", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+            Resource: !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+
+  # ---------------- Route 53 Resolver DNS Firewall (egress allow-list) ----------------
+  AllowedDomains:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Name: !Sub "${Project}-allowed-domains"
+      Domains: ["*.amazonaws.com.", "*.aws.amazon.com.", "amazonaws.com."]
+  AllOtherDomains:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Name: !Sub "${Project}-block-all-else"
+      Domains: ["*."]
+  DnsFirewallRuleGroup:
+    Type: AWS::Route53Resolver::FirewallRuleGroup
+    Properties:
+      Name: !Sub "${Project}-dns-egress"
+      FirewallRules:
+        - { FirewallDomainListId: !Ref AllowedDomains, Priority: 100, Action: ALLOW }
+        - { FirewallDomainListId: !Ref AllOtherDomains, Priority: 200, Action: BLOCK, BlockResponse: NXDOMAIN }
+  DnsFirewallAssoc:
+    Type: AWS::Route53Resolver::FirewallRuleGroupAssociation
+    Properties:
+      Name: !Sub "${Project}-dns-egress-assoc"
+      FirewallRuleGroupId: !Ref DnsFirewallRuleGroup
+      VpcId: !Ref Vpc
+      Priority: 101
+      MutationProtection: DISABLED
+
+  # ---------------- VPC Flow Logs (PCI DSS Req. 10) ----------------
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/${Project}/vpc-flow-logs"
+      RetentionInDays: 365
+      KmsKeyId: !Ref LogKeyArn
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt FlowLogGroup.Arn
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60
+
+  # ---------------- Site-to-site VPN to the partner bank ----------------
+  Vgw:
+    Type: AWS::EC2::VPNGateway
+    Condition: CreateVpn
+    Properties:
+      Type: ipsec.1
+      Tags: [{ Key: Name, Value: !Sub "${Project}-vgw" }]
+  VgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpn
+    Properties: { VpcId: !Ref Vpc, VpnGatewayId: !Ref Vgw }
+  PartnerCgw:
+    Type: AWS::EC2::CustomerGateway
+    Condition: CreateVpn
+    Properties:
+      Type: ipsec.1
+      BgpAsn: 65010
+      IpAddress: !Ref PartnerGatewayIp
+      Tags: [{ Key: Name, Value: !Sub "${Project}-cgw-partner-bank" }]
+  PartnerVpn:
+    Type: AWS::EC2::VPNConnection
+    Condition: CreateVpn
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref PartnerCgw
+      VpnGatewayId: !Ref Vgw
+      StaticRoutesOnly: true
+      VpnTunnelOptionsSpecifications:
+        - { Phase1EncryptionAlgorithms: [{ Value: AES256 }], Phase2EncryptionAlgorithms: [{ Value: AES256 }], Phase1IntegrityAlgorithms: [{ Value: SHA2-256 }], Phase2IntegrityAlgorithms: [{ Value: SHA2-256 }], IKEVersions: [{ Value: ikev2 }], Phase1DHGroupNumbers: [{ Value: 20 }], Phase2DHGroupNumbers: [{ Value: 20 }] }
+        - { Phase1EncryptionAlgorithms: [{ Value: AES256 }], Phase2EncryptionAlgorithms: [{ Value: AES256 }], Phase1IntegrityAlgorithms: [{ Value: SHA2-256 }], Phase2IntegrityAlgorithms: [{ Value: SHA2-256 }], IKEVersions: [{ Value: ikev2 }], Phase1DHGroupNumbers: [{ Value: 20 }], Phase2DHGroupNumbers: [{ Value: 20 }] }
+      Tags: [{ Key: Name, Value: !Sub "${Project}-vpn-partner-bank" }]
+  PartnerVpnRoute:
+    Type: AWS::EC2::VPNConnectionRoute
+    Condition: CreateVpn
+    Properties: { VpnConnectionId: !Ref PartnerVpn, DestinationCidrBlock: !Ref PartnerCidr }
+  VpnRoutePropagation:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    Condition: CreateVpn
+    DependsOn: VgwAttach
+    Properties:
+      RouteTableIds: [!Ref AppRt]
+      VpnGatewayId: !Ref Vgw
+
+Outputs:
+  VpcId: { Value: !Ref Vpc, Export: { Name: !Sub "${Project}-VpcId" } }
+  AppSubnets: { Value: !Join [",", [!Ref AppA, !Ref AppB]], Export: { Name: !Sub "${Project}-AppSubnets" } }
+  DataSubnets: { Value: !Join [",", [!Ref DataA, !Ref DataB]], Export: { Name: !Sub "${Project}-DataSubnets" } }
+  LambdaSg: { Value: !Ref LambdaSg, Export: { Name: !Sub "${Project}-LambdaSg" } }
+  DynamoPrefixList: { Value: !Ref DynamoPrefixListId }

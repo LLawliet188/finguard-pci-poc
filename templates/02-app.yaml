@@ -1,0 +1,537 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  FinGuard PCI PoC - Layer 2 application. Cognito (MFA mandatory) -> AWS WAF ->
+  API Gateway (schema validation, throttling, X-Ray) -> Lambda in private subnets
+  -> DynamoDB encrypted with a customer managed key (PITR, AWS Backup), PAN
+  tokenised with KMS HMAC, plus dashboard and operational alarms.
+
+Parameters:
+  Project:
+    Type: String
+    Default: finguard
+  ReservedConcurrency:
+    Type: Number
+    Default: 0
+    Description: 0 = unreserved (accounts with a 10-concurrency quota cannot reserve)
+  EnableWaf:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  RateLimitPer5Min:
+    Type: Number
+    Default: 1000
+  TableDeletionProtection:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"   # PoC teardown; production = true
+
+Conditions:
+  UseReserved: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  CreateWaf: !Equals [!Ref EnableWaf, "true"]
+
+Resources:
+  # =====================================================================
+  # Storage - cardholder data environment
+  # =====================================================================
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub "${Project}-transactions"
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !Ref TableDeletionProtection
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: { "Fn::ImportValue": !Sub "${Project}-DataKeyArn" }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+        RecoveryPeriodInDays: 35
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+      Tags: [{ Key: pci-scope, Value: cde }, { Key: backup, Value: daily }]
+
+  SettlementBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Object-level access is recorded by CloudTrail S3 data events (cheaper and tamper-evident)"
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${Project}-settlement-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: { "Fn::ImportValue": !Sub "${Project}-DataKeyArn" }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      LifecycleConfiguration:
+        Rules:
+          - { Id: tiering, Status: Enabled, Transitions: [{ StorageClass: GLACIER_IR, TransitionInDays: 30 }], NoncurrentVersionExpiration: { NoncurrentDays: 30 } }
+      Tags: [{ Key: pci-scope, Value: cde }]
+  SettlementBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SettlementBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTls
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt SettlementBucket.Arn, !Sub "${SettlementBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+          - Sid: DenyOldTls
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt SettlementBucket.Arn, !Sub "${SettlementBucket.Arn}/*"]
+            Condition: { NumericLessThan: { "s3:TlsVersion": "1.2" } }
+          - Sid: DenyWrongKey
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${SettlementBucket.Arn}/*"
+            Condition:
+              StringNotEqualsIfExists:
+                "s3:x-amz-server-side-encryption-aws-kms-key-id": { "Fn::ImportValue": !Sub "${Project}-DataKeyArn" }
+
+  # Backup & DR: daily backups, 35-day retention, deletion of recovery points denied
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Delete
+    Properties:
+      BackupVaultName: !Sub "${Project}-vault"
+      EncryptionKeyArn: { "Fn::ImportValue": !Sub "${Project}-DataKeyArn" }
+      AccessPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyRecoveryPointDeletionExceptAdmin
+            Effect: Deny
+            Principal: "*"
+            Action: ["backup:DeleteRecoveryPoint", "backup:UpdateRecoveryPointLifecycle"]
+            Resource: "*"
+            Condition:
+              ArnNotLike: { "aws:PrincipalArn": [!Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root", !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"] }
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub "${Project}-daily"
+        BackupPlanRule:
+          - RuleName: daily-35d
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 2 * * ? *)
+            StartWindowMinutes: 60
+            Lifecycle: { DeleteAfterDays: 35 }
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: backup.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores"
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: cde-tables
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources: [!GetAtt TransactionsTable.Arn]
+
+  # =====================================================================
+  # Identity for API consumers - Cognito with mandatory MFA
+  # =====================================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Delete
+    Properties:
+      UserPoolName: !Sub "${Project}-customers"
+      MfaConfiguration: "ON"
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      UsernameConfiguration: { CaseSensitive: false }
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: admin_only, Priority: 1 }]
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${Project}-api-client"
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 8
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: hours }
+
+  # =====================================================================
+  # Compute - transaction Lambda in the private app subnets
+  # =====================================================================
+  TxnLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Project}-transactions"
+      RetentionInDays: 365
+      KmsKeyId: { "Fn::ImportValue": !Sub "${Project}-LogKeyArn" }
+  TxnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-txn-lambda"
+      PermissionsBoundary: { "Fn::ImportValue": !Sub "${Project}-WorkloadBoundaryArn" }
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess"
+      Policies:
+        - PolicyName: least-privilege-cde
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: TableItemsOnly
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:ConditionCheckItem]
+                Resource: !GetAtt TransactionsTable.Arn
+              - Sid: UseDataKeyOnlyThroughDynamoDB
+                Effect: Allow
+                Action: [kms:Decrypt, kms:DescribeKey]
+                Resource: { "Fn::ImportValue": !Sub "${Project}-DataKeyArn" }
+                Condition:
+                  StringEquals: { "kms:ViaService": !Sub "dynamodb.${AWS::Region}.amazonaws.com" }
+              - Sid: TokeniseOnly
+                Effect: Allow
+                Action: kms:GenerateMac
+                Resource: { "Fn::ImportValue": !Sub "${Project}-TokenKeyArn" }
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${TxnLogGroup.Arn}:*"
+  TxnFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: "Invoked synchronously by API Gateway; a DLQ only applies to asynchronous invocations"
+          - id: CKV_AWS_173
+            comment: "Variables hold no secrets (table name, key ARN); the CDE data key denies direct Decrypt, so the AWS managed Lambda key is used"
+    Properties:
+      FunctionName: !Sub "${Project}-transactions"
+      Description: FinGuard payment instruction API (PCI CDE)
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: ../src/transactions
+      MemorySize: 512
+      Timeout: 10
+      Role: !GetAtt TxnRole.Arn
+      ReservedConcurrentExecutions: !If [UseReserved, !Ref ReservedConcurrency, !Ref "AWS::NoValue"]
+      TracingConfig: { Mode: Active }
+      LoggingConfig: { LogGroup: !Ref TxnLogGroup, LogFormat: JSON, ApplicationLogLevel: INFO, SystemLogLevel: WARN }
+      VpcConfig:
+        SubnetIds: !Split [",", { "Fn::ImportValue": !Sub "${Project}-AppSubnets" }]
+        SecurityGroupIds: [{ "Fn::ImportValue": !Sub "${Project}-LambdaSg" }]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TransactionsTable
+          HMAC_KEY_ID: { "Fn::ImportValue": !Sub "${Project}-TokenKeyArn" }
+          REVIEW_THRESHOLD_MINOR: "500000"
+      Tags: [{ Key: pci-scope, Value: cde }]
+
+  # =====================================================================
+  # Edge - API Gateway (REST) with Cognito authoriser and request validation
+  # =====================================================================
+  ApiGwCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: apigateway.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"]
+  ApiGwAccount:
+    Type: AWS::ApiGateway::Account
+    Properties: { CloudWatchRoleArn: !GetAtt ApiGwCloudWatchRole.Arn }
+
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${Project}-payments-api"
+      Description: FinGuard payment instructions
+      EndpointConfiguration: { Types: [REGIONAL] }
+      DisableExecuteApiEndpoint: false
+      MinimumCompressionSize: 1024
+  Authorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: cognito-mfa
+      RestApiId: !Ref Api
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs: [!GetAtt UserPool.Arn]
+  BodyValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties: { RestApiId: !Ref Api, Name: body-and-params, ValidateRequestBody: true, ValidateRequestParameters: true }
+  TxnModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref Api
+      Name: PaymentInstruction
+      ContentType: application/json
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        type: object
+        additionalProperties: false
+        required: [card_number, amount_minor, currency, beneficiary_iban]
+        properties:
+          card_number: { type: string, pattern: "^[0-9 ]{13,23}$" }
+          amount_minor: { type: integer, minimum: 1, maximum: 10000000 }
+          currency: { type: string, pattern: "^[A-Z]{3}$" }
+          beneficiary_iban: { type: string, minLength: 15, maxLength: 34 }
+  TxnResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: { RestApiId: !Ref Api, ParentId: !GetAtt Api.RootResourceId, PathPart: transactions }
+  TxnIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: { RestApiId: !Ref Api, ParentId: !Ref TxnResource, PathPart: "{id}" }
+  PostTxn:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref TxnResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref Authorizer
+      RequestValidatorId: !Ref BodyValidator
+      RequestModels: { application/json: !Ref TxnModel }
+      RequestParameters: { method.request.header.Idempotency-Key: true }
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TxnFunction.Arn}/invocations"
+  GetTxn:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref TxnIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref Authorizer
+      RequestParameters: { method.request.path.id: true }
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TxnFunction.Arn}/invocations"
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TxnFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [PostTxn, GetTxn]
+    Properties: { RestApiId: !Ref Api }
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/${Project}/api-access"
+      RetentionInDays: 365
+      KmsKeyId: { "Fn::ImportValue": !Sub "${Project}-LogKeyArn" }
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_120
+            comment: "Caching deliberately disabled - responses contain account-specific payment data (PCI DSS 3.2)"
+    DependsOn: ApiGwAccount
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref Deployment
+      StageName: v1
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt AccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","user":"$context.authorizer.claims.sub","method":"$context.httpMethod","path":"$context.resourcePath","status":"$context.status","latencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integration.latency","wafStatus":"$context.waf.status","xrayTraceId":"$context.xrayTraceId"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 40
+          ThrottlingBurstLimit: 10   # = Lambda concurrency quota; excess gets 429, not 500
+          MetricsEnabled: true
+          LoggingLevel: ERROR
+          DataTraceEnabled: false     # never log request bodies (PAN) - PCI DSS 3.3
+
+  # =====================================================================
+  # AWS WAF in front of the API
+  # =====================================================================
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: CreateWaf
+    Properties:
+      Name: !Sub "${Project}-api-waf"
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: !Sub "${Project}-waf" }
+      Rules:
+        - Name: rate-limit-per-ip
+          Priority: 0
+          Action: { Block: {} }
+          Statement: { RateBasedStatement: { Limit: !Ref RateLimitPer5Min, AggregateKeyType: IP, EvaluationWindowSec: 300 } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: rate-limit }
+        - Name: aws-ip-reputation
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: ip-reputation }
+        - Name: aws-common
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: common }
+        - Name: aws-known-bad-inputs
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: bad-inputs }
+        - Name: aws-sqli
+          Priority: 4
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: sqli }
+  WebAclAssoc:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: CreateWaf
+    Properties:
+      ResourceArn: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${Api}/stages/${Stage}"
+      WebACLArn: !GetAtt WebAcl.Arn
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateWaf
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "aws-waf-logs-${Project}"
+      RetentionInDays: 365
+      KmsKeyId: { "Fn::ImportValue": !Sub "${Project}-LogKeyArn" }
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: CreateWaf
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs: [!GetAtt WafLogGroup.Arn]
+      RedactedFields: [{ SingleHeader: { Name: authorization } }]
+
+  # =====================================================================
+  # Observability - alarms + dashboard
+  # =====================================================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-txn-lambda-errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref TxnFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${Project}-SecurityTopicArn" }]
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-txn-lambda-throttles"
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Ref TxnFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${Project}-SecurityTopicArn" }]
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-api-5xx"
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions: [{ Name: ApiName, Value: !Sub "${Project}-payments-api" }, { Name: Stage, Value: v1 }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${Project}-SecurityTopicArn" }]
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-api-p99-latency"
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions: [{ Name: ApiName, Value: !Sub "${Project}-payments-api" }, { Name: Stage, Value: v1 }]
+      ExtendedStatistic: p99
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [{ "Fn::ImportValue": !Sub "${Project}-SecurityTopicArn" }]
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${Project}-operations"
+      DashboardBody: !Sub |
+        {"widgets":[
+         {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"API requests and errors","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/ApiGateway","Count","ApiName","${Project}-payments-api","Stage","v1"],[".","4XXError",".",".",".","."],[".","5XXError",".",".",".","."]]}},
+         {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"API latency p50 / p95 / p99 (ms)","region":"${AWS::Region}","period":60,"metrics":[["AWS/ApiGateway","Latency","ApiName","${Project}-payments-api","Stage","v1",{"stat":"p50"}],["...",{"stat":"p95"}],["...",{"stat":"p99"}]]}},
+         {"type":"metric","x":0,"y":6,"width":8,"height":6,"properties":{"title":"Lambda concurrency, errors, throttles","region":"${AWS::Region}","period":60,"metrics":[["AWS/Lambda","ConcurrentExecutions","FunctionName","${TxnFunction}",{"stat":"Maximum"}],[".","Errors",".",".",{"stat":"Sum"}],[".","Throttles",".",".",{"stat":"Sum"}]]}},
+         {"type":"metric","x":8,"y":6,"width":8,"height":6,"properties":{"title":"DynamoDB consumed capacity","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/DynamoDB","ConsumedWriteCapacityUnits","TableName","${TransactionsTable}"],[".","ConsumedReadCapacityUnits",".","."]]}},
+         {"type":"metric","x":16,"y":6,"width":8,"height":6,"properties":{"title":"WAF allowed vs blocked","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/WAFV2","AllowedRequests","WebACL","${Project}-api-waf","Rule","ALL","Region","${AWS::Region}"],[".","BlockedRequests",".",".",".",".",".","."]]}}
+        ]}
+
+Outputs:
+  ApiUrl: { Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1" }
+  UserPoolId: { Value: !Ref UserPool }
+  UserPoolClientId: { Value: !Ref UserPoolClient }
+  TableName: { Value: !Ref TransactionsTable }
+  FunctionName: { Value: !Ref TxnFunction }
+  BackupVaultName: { Value: !Ref BackupVault }
+  SettlementBucketName: { Value: !Ref SettlementBucket }

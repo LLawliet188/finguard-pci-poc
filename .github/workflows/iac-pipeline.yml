@@ -1,0 +1,50 @@
+name: finguard-iac-pipeline
+# Every change to the infrastructure passes four automated gates before a human
+# approves the deployment (PCI DSS 6.5.1 change control / DORA Art. 9).
+on:
+  pull_request:
+    paths: ["templates/**", "src/**", "policy/**", "tests/**"]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write        # OIDC federation - no long-lived AWS keys in GitHub
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install tooling
+        run: |
+          pip install cfn-lint==1.57.2 checkov==3.3.29 pytest==9.1.1 moto==5.2.4 boto3==1.35.49
+          curl -sSL https://github.com/aws-cloudformation/cloudformation-guard/releases/download/3.2.1/cfn-guard-v3-x86_64-ubuntu-latest.tar.gz | tar xz
+          sudo cp $(find . -name cfn-guard -type f | head -1) /usr/local/bin/
+      - name: Gate 1 - template syntax (cfn-lint)
+        run: cfn-lint templates/*.yaml --ignore-checks W3002
+      - name: Gate 2 - security misconfiguration scan (Checkov)
+        run: checkov -d templates --framework cloudformation --compact
+      - name: Gate 3 - PCI DSS policy-as-code (CloudFormation Guard)
+        run: |
+          cfn-guard validate -d templates -r policy/finguard-pci.guard --show-summary fail
+          ! cfn-guard validate -d tests/non-compliant.yaml -r policy/finguard-pci.guard >/dev/null
+      - name: Gate 4 - unit tests (handler, tokenisation, idempotency, isolation)
+        run: python -m pytest -q tests
+
+  deploy:
+    needs: verify
+    # runs only once an AWS deploy role is configured as a repository variable
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    environment: production          # requires a named reviewer (four-eyes principle)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+      - name: Deploy stacks
+        run: ./scripts/deploy.sh

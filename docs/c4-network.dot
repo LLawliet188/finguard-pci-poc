@@ -1,0 +1,68 @@
+digraph C4 {
+  graph [rankdir=TB, fontname="DejaVu Sans", fontsize=15, pad=0.25, nodesep=0.45, ranksep=0.42, compound=true, newrank=true, splines=spline];
+  node  [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=13, fontcolor=white, color="#0B4884", fillcolor="#1168BD", margin="0.16,0.08"];
+  edge  [fontname="DejaVu Sans", fontsize=11.5, color="#555555", fontcolor="#222222", arrowsize=0.8];
+
+  person [fillcolor="#08427B", label=<<b>Customer / merchant app</b><br/><font point-size="11">[Person / external client]</font>>];
+
+  subgraph cluster_aws {
+    label=<<b>AWS Cloud - Region eu-central-1 (Frankfurt)</b>  <font point-size="12">[deployment boundary]</font>>; labeljust=l; style="dashed,rounded"; color="#444444"; fontsize=15;
+
+    subgraph cluster_edge {
+      label=<<b>Regional edge (outside the VPC)</b>>; labeljust=l; style="dashed,rounded"; color="#888888"; fontsize=13.5;
+      waf [fillcolor="#C0392B", color="#922B21", label=<<b>AWS WAF web ACL</b><br/><font point-size="11">rate limit 1,000/5 min/IP · SQLi · bad inputs · IP reputation</font>>];
+      cog [fillcolor="#C0392B", color="#922B21", label=<<b>Amazon Cognito</b><br/><font point-size="11">password + TOTP MFA (mandatory)</font>>];
+      api [label=<<b>API Gateway (REST, stage v1)</b><br/><font point-size="11">JWT authoriser · JSON schema · 50 rps / burst 100</font>>];
+    }
+
+    subgraph cluster_vpc {
+      label=<<b>VPC 10.20.0.0/16 - cardholder data environment</b><br/><font point-size="11.5">Flow Logs (ALL) · Route 53 DNS Firewall allow-list · default SG closed</font>>; labeljust=l; style="rounded"; color="#1168BD"; penwidth=2; fontsize=14;
+      subgraph cluster_pub {
+        label=<<b>Public subnets</b> 10.20.0.0/24 · 10.20.1.0/24 (AZ a, b)  <font point-size="11">route 0.0.0.0/0 to IGW; no CDE workloads</font>>; labeljust=l; style="filled,rounded"; fillcolor="#FDEDEC"; color="#E6B0AA"; fontsize=12.5;
+        igw [fillcolor="#7F8C8D", color="#626567", label=<<b>Internet gateway</b><br/><font point-size="11">reserved for future ALB / NAT</font>>];
+      }
+      subgraph cluster_app {
+        label=<<b>Private app subnets</b> 10.20.2.0/24 · 10.20.3.0/24 (AZ a, b)<br/><font point-size="11">no default route · NACL: 443 from VPC and partner only · SG egress 443 to endpoints</font>>; labeljust=l; style="filled,rounded"; fillcolor="#EAF2FB"; color="#AED6F1"; fontsize=12.5;
+        fn  [label=<<b>Transaction Lambda</b><br/><font point-size="11">[Python 3.12, arm64] validates · tokenises · writes</font>>];
+        kep [fillcolor="#2E86C1", label=<<b>KMS interface endpoint</b><br/><font point-size="11">ENI per AZ · policy: own-account keys</font>>];
+      }
+      gwe [fillcolor="#2E86C1", label=<<b>Gateway endpoints</b><br/><font point-size="11">DynamoDB + S3 · s3:ResourceAccount perimeter</font>>];
+      vgw [fillcolor="#6C3483", color="#4A235A", label=<<b>Virtual private gateway</b><br/><font point-size="11">2 IPsec tunnels · IKEv2 · AES-256 · DH 20</font>>];
+      subgraph cluster_data {
+        label=<<b>Isolated data subnets</b> 10.20.4.0/24 · 10.20.5.0/24 (AZ a, b)  <font point-size="11">no internet, no VPN route</font>>; labeljust=l; style="filled,rounded"; fillcolor="#EAF7EE"; color="#A9DFBF"; fontsize=12.5;
+        res [fillcolor="#52BE80", color="#239B56", label=<<b>Reserved data tier</b><br/><font point-size="11">future relational ledger</font>>];
+      }
+    }
+
+    subgraph cluster_svc {
+      label=<<b>Regional AWS services</b>  <font point-size="11.5">reached only through endpoints</font>>; labeljust=l; style="dashed,rounded"; color="#888888"; fontsize=13.5;
+      kms [fillcolor="#1E8449", color="#145A32", label=<<b>AWS KMS</b><br/><font point-size="11">CMK data key + HMAC_256 key</font>>];
+      ddb [fillcolor="#1E8449", color="#145A32", label=<<b>DynamoDB table</b><br/><font point-size="11">SSE-KMS (CMK) · PITR 35 days</font>>];
+      s3  [fillcolor="#1E8449", color="#145A32", label=<<b>S3 settlement bucket</b><br/><font point-size="11">SSE-KMS · TLS 1.2+ only</font>>];
+    }
+  }
+  bank [fillcolor="#999999", color="#6B6B6B", label=<<b>Partner bank network</b><br/><font point-size="11">[external system] 172.31.200.0/24</font>>];
+
+  person -> cog [label=" 1  sign-in\n(SRP + TOTP)", style=dashed];
+  person -> waf [label=" 2  HTTPS + JWT\n(TLS 1.2+)"];
+  waf -> api [label=" 3  inspected"];
+  cog -> api [label="JWT check", style=dashed];
+  api -> fn [label=" 4  Lambda proxy invoke\n (ENI in app subnet)", lhead=cluster_app];
+  fn -> kep [label=" 5  GenerateMac :443"];
+  kep -> kms [label=" private"];
+  fn -> gwe [label=" 6  Put/GetItem :443"];
+  gwe -> ddb [label=" private"];
+  gwe -> s3;
+  fn -> vgw [label=" 7  :443 to partner\n (propagated route)"];
+  vgw -> bank [label=" IPsec", constraint=false, color="#6C3483", fontcolor="#6C3483"];
+
+  api -> igw [style=invis, weight=10];
+  igw -> fn [style=invis];
+  res -> ddb [style=invis, weight=10];
+  gwe -> res [style=invis];
+  vgw -> res [style=invis];
+  { rank=same; waf; cog; }
+  { rank=same; fn; kep; }
+  { rank=same; gwe; vgw; }
+  { rank=same; kms; ddb; s3; }
+}
